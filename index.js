@@ -41,8 +41,6 @@ app.use((req, res, next) => {
   next();
 });
 
-
-
 // CORS
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -76,6 +74,35 @@ function withTimeout(promise, ms) {
 
 function normalizeString(str) {
   return (str || "").toLowerCase().trim();
+}
+
+// ==========================
+// 🌍 TRANSLATION RU → EN
+// ==========================
+async function translateRuToEn(text) {
+  try {
+    const response = await fetch("https://libretranslate.de/translate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        q: text,
+        source: "ru",
+        target: "en",
+        format: "text",
+      }),
+    });
+
+    if (!response.ok) {
+      console.error("Translation error:", response.status);
+      return text; // fallback
+    }
+
+    const data = await response.json();
+    return data.translatedText || text;
+  } catch (err) {
+    console.error("Translation error:", err.message);
+    return text;
+  }
 }
 
 // ==========================
@@ -159,7 +186,7 @@ async function searchUSDA(query, limit) {
 // 🔍 OFF SEARCH (disabled)
 // ==========================
 async function searchOFF() {
-  return []; // временно отключено
+  return []; // current OFF is disabled
 }
 
 // ==========================
@@ -227,9 +254,13 @@ app.get("/api/search", async (req, res) => {
   if (limit > SEARCH_LIMIT_MAX) limit = SEARCH_LIMIT_MAX;
 
   try {
+    // Если кириллица — переводим:
+    const hasCyrillic = /[а-яА-ЯЁё]/.test(query);
+    const translated = hasCyrillic ? await translateRuToEn(query) : query;
+
     const [local, usda] = await Promise.all([
       searchLocal(query, limit),
-      searchUSDA(query, limit),
+      searchUSDA(translated, limit),
     ]);
 
     const off = [];
@@ -238,6 +269,7 @@ app.get("/api/search", async (req, res) => {
 
     res.json({
       query,
+      translated,
       limit,
       counts: {
         local: local.length,
@@ -248,6 +280,7 @@ app.get("/api/search", async (req, res) => {
       results,
     });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
