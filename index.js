@@ -90,69 +90,33 @@ async function translateRuToEn(text) {
   const hasCyrillic = /[а-яА-ЯЁё]/.test(original);
   if (!hasCyrillic) return original;
 
-  // Если нет URL переводчика — просто ничего не делаем
-  if (!TRANSLATE_API_URL) return original;
+  const url =
+    "https://api.mymemory.translated.net/get?q=" +
+    encodeURIComponent(original) +
+    "&langpair=ru|en";
 
   try {
-    const res = await withTimeout(
-      fetch(TRANSLATE_API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        // формат LibreTranslate
-        body: JSON.stringify({
-          q: original,
-          source: "ru",
-          target: "en",
-          format: "text",
-        }),
-      }),
-      HTTP_TIMEOUT_MS
-    );
-
+    const res = await withTimeout(fetch(url), 2000);
     const raw = await res.text();
-
-    if (!res.ok) {
-      console.error(
-        "[translateRuToEn] Bad status from translation API:",
-        res.status,
-        res.statusText,
-        "| body snippet:",
-        raw.slice(0, 200)
-      );
-      return original;
-    }
 
     let data;
     try {
       data = JSON.parse(raw);
-    } catch (e) {
-      console.error(
-        "[translateRuToEn] JSON parse error:",
-        e.message,
-        "| body snippet:",
-        raw.slice(0, 200)
-      );
+    } catch {
+      console.error("[translateRuToEn] JSON parse failed. Body:", raw.slice(0, 200));
       return original;
     }
 
-    const translated =
-      data && typeof data.translatedText === "string"
-        ? data.translatedText
-        : null;
+    const translated = data?.responseData?.translatedText;
+    if (!translated) return original;
 
-    if (!translated) {
-      console.error("[translateRuToEn] Unexpected translation response:", data);
-      return original;
-    }
-
-    return translated;
-  } catch (e) {
-    console.error("[translateRuToEn] Error:", e.message);
+    return translated.toLowerCase();
+  } catch (err) {
+    console.error("[translateRuToEn] error:", err.message);
     return original;
   }
 }
+
 
 // ==========================
 // 🔍 LOCAL SEARCH
