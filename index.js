@@ -257,25 +257,6 @@ app.get("/health", async (req, res) => {
 });
 
 // ==========================
-// 🌐 TRANSLATION HELPERS
-// ==========================
-async function detectLanguage(str) {
-  return /[А-Яа-яЁё]/.test(str) ? "ru" : "en";
-}
-
-async function translateToRussian(text) {
-  try {
-    const res = await fetch("https://api.mymemory.translated.net/get?q=" +
-      encodeURIComponent(text) + "&langpair=en|ru");
-
-    const data = await res.json();
-    return data?.responseData?.translatedText || text;
-  } catch {
-    return text;
-  }
-}
-
-// ==========================
 // 🔎 /api/search
 // ==========================
 app.get("/api/search", async (req, res) => {
@@ -286,40 +267,24 @@ app.get("/api/search", async (req, res) => {
   if (limit <= 0) limit = SEARCH_LIMIT_DEFAULT;
   if (limit > SEARCH_LIMIT_MAX) limit = SEARCH_LIMIT_MAX;
 
-  const originalLang = detectLanguage(query);
-
   try {
-    // translate query to EN for USDA
-    let translatedQuery = query;
-    if (originalLang === "ru") {
-      translatedQuery = await translateToEN(query);
-    }
+    // 1) ВСЕГДА ищем локально по оригинальной строке
+    const localPromise = searchLocal(query, limit);
 
-    // run searches
-    const [local, usda] = await Promise.all([
-      searchLocal(query, limit),
-      searchUSDA(translatedQuery, limit),
-    ]);
+    // 2) Для USDA — если есть кириллица, пробуем перевод, если нет — шлём как есть
+    const hasCyrillic = /[а-яА-ЯЁё]/.test(query);
+    const usdaQuery = hasCyrillic ? await translateRuToEn(query) : query;
 
+    const usdaPromise = searchUSDA(usdaQuery, limit);
+
+    const [local, usda] = await Promise.all([localPromise, usdaPromise]);
     const off = [];
 
-    // merge
-    let results = mergeResults(query, local, usda, off, limit);
-
-    // NOW: translate USDA results back to Russian
-    if (originalLang === "ru") {
-      for (const item of results) {
-        if (item.source === "usda") {
-          item.product = await translateToRussian(item.product);
-          if (item.brand) {
-            item.brand = await translateToRussian(item.brand);
-          }
-        }
-      }
-    }
+    const results = mergeResults(query, local, usda, off, limit);
 
     res.json({
       query,
+      usdaQuery,
       limit,
       counts: {
         local: local.length,
@@ -330,6 +295,7 @@ app.get("/api/search", async (req, res) => {
       results,
     });
   } catch (err) {
+    console.error("[/api/search] error:", err.message);
     res.status(500).json({ error: "Internal server error" });
   }
 });
