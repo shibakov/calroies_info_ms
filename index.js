@@ -316,6 +316,41 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
+// ==============================
+// 📌 AUTO-ADD to food_dict
+// ==============================
+app.post("/api/auto-add", async (req, res) => {
+  try {
+    const p = req.body;
+
+    if (!pool) {
+      return res.status(500).json({error: "No DB connection"});
+    }
+
+    const sql = `
+      INSERT INTO personal.food_dict (product, kcal_100, protein_100, fat_100, carbs_100)
+      VALUES ($1,$2,$3,$4,$5)
+      ON CONFLICT (product) DO NOTHING
+      RETURNING *;
+    `;
+
+    const params = [
+      p.product,
+      p.kcal_100,
+      p.protein_100,
+      p.fat_100,
+      p.carbs_100
+    ];
+
+    await pool.query(sql, params);
+
+    res.json({ok:true});
+  } catch (err) {
+    console.error("AUTO ADD ERROR", err);
+    res.status(500).json({error:"internal"});
+  }
+});
+
 // ==========================
 // 🚀 СТАРТ СЕРВЕРА
 // ==========================
