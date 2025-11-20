@@ -89,7 +89,7 @@ async function searchLocal(query, limit) {
       COALESCE(protein_100, 0) AS protein_100,
       COALESCE(fat_100, 0)     AS fat_100,
       COALESCE(carbs_100, 0)   AS carbs_100,
-      COALESCE(brand, NULL)    AS brand
+      NULL                     AS brand
     FROM personal.food_dict
     WHERE product ILIKE '%' || $1 || '%'
     ORDER BY product
@@ -103,7 +103,7 @@ async function searchLocal(query, limit) {
     source: "local",
     id: `local_${idx}_${row.product}`,
     product: row.product,
-    brand: row.brand,
+    brand: null,
     kcal_100: Number(row.kcal_100),
     protein_100: Number(row.protein_100),
     fat_100: Number(row.fat_100),
