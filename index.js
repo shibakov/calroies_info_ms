@@ -11,12 +11,7 @@ const USDA_API_KEY =
   process.env.USDA_API_KEY ||
   "HPvXo9CKZSxS4bcAldlVWmVl2geBSI8pnilD9v3a";
 
-// 🔁 внешний бесплатный переводчик (можно переопределить env-переменной)
-const TRANSLATE_API_URL =
-  process.env.TRANSLATE_API_URL || "https://libretranslate.de/translate";
-
 const USDA_BASE_URL = "https://api.nal.usda.gov/fdc/v1/foods/search";
-const OFF_BASE_URL = "https://world.openfoodfacts.org/cgi/search.pl";
 
 const SEARCH_LIMIT_DEFAULT = 10;
 const SEARCH_LIMIT_MAX = 25;
@@ -36,7 +31,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-// 🚫 Disable caching for API responses globally
+// 🚫 Disable caching
 app.use((req, res, next) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.setHeader("Pragma", "no-cache");
@@ -65,7 +60,7 @@ const pool = PG_CONNECTION_STRING
   : null;
 
 // ==========================
-// ⏱ TIMEOUT WRAPPER
+// ⏱ TIMEOUT UTILS
 // ==========================
 function withTimeout(promise, ms) {
   return Promise.race([
@@ -81,8 +76,10 @@ function normalizeString(str) {
 }
 
 // ==========================
-// 🌐 TRANSLATION (RU → EN)
+// 🌐 TRANSLATION HELPERS (Google unofficial)
 // ==========================
+
+// RU → EN
 async function translateRuToEn(text) {
   const original = text || "";
   if (!original.trim()) return original;
@@ -91,32 +88,60 @@ async function translateRuToEn(text) {
   if (!hasCyrillic) return original;
 
   const url =
-    "https://api.mymemory.translated.net/get?q=" +
-    encodeURIComponent(original) +
-    "&langpair=ru|en";
+    "https://translate.googleapis.com/translate_a/single?client=gtx&sl=ru&tl=en&dt=t&q=" +
+    encodeURIComponent(original);
 
   try {
     const res = await withTimeout(fetch(url), 2000);
     const raw = await res.text();
 
-    let data;
+    let json;
     try {
-      data = JSON.parse(raw);
-    } catch {
-      console.error("[translateRuToEn] JSON parse failed. Body:", raw.slice(0, 200));
+      json = JSON.parse(raw);
+    } catch (e) {
+      console.error("[translateRuToEn] Parse error, body:", raw.slice(0, 150));
       return original;
     }
 
-    const translated = data?.responseData?.translatedText;
-    if (!translated) return original;
-
-    return translated.toLowerCase();
+    const translated = json?.[0]?.[0]?.[0];
+    return translated?.toLowerCase() || original;
   } catch (err) {
-    console.error("[translateRuToEn] error:", err.message);
+    console.error("[translateRuToEn] Network error:", err.message);
     return original;
   }
 }
 
+// EN → RU
+async function translateEnToRu(text) {
+  const original = text || "";
+  if (!original.trim()) return original;
+
+  const isAscii = /^[\x00-\x7F]+$/.test(original);
+  if (!isAscii) return original; // уже русский — не переводим
+
+  const url =
+    "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ru&dt=t&q=" +
+    encodeURIComponent(original);
+
+  try {
+    const res = await withTimeout(fetch(url), 2000);
+    const raw = await res.text();
+
+    let json;
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      console.error("[translateEnToRu] Parse error, body:", raw.slice(0, 150));
+      return original;
+    }
+
+    const translated = json?.[0]?.[0]?.[0];
+    return translated || original;
+  } catch (err) {
+    console.error("[translateEnToRu] Network error:", err.message);
+    return original;
+  }
+}
 
 // ==========================
 // 🔍 LOCAL SEARCH
@@ -168,6 +193,7 @@ async function searchUSDA(query, limit) {
   try {
     const res = await withTimeout(fetch(url.toString()), HTTP_TIMEOUT_MS);
     if (!res.ok) return [];
+
     const data = await res.json();
     if (!data.foods) return [];
 
@@ -196,10 +222,10 @@ async function searchUSDA(query, limit) {
 }
 
 // ==========================
-// 🔍 OFF SEARCH (disabled)
+// 🔍 OFF (disabled)
 // ==========================
 async function searchOFF() {
-  return []; // временно отключено
+  return [];
 }
 
 // ==========================
@@ -251,7 +277,7 @@ app.get("/health", async (req, res) => {
   try {
     if (pool) await pool.query("SELECT 1");
     res.json({ ok: true });
-  } catch (e) {
+  } catch {
     res.status(500).json({ ok: false });
   }
 });
@@ -268,10 +294,8 @@ app.get("/api/search", async (req, res) => {
   if (limit > SEARCH_LIMIT_MAX) limit = SEARCH_LIMIT_MAX;
 
   try {
-    // 1) ВСЕГДА ищем локально по оригинальной строке
     const localPromise = searchLocal(query, limit);
 
-    // 2) Для USDA — если есть кириллица, пробуем перевод, если нет — шлём как есть
     const hasCyrillic = /[а-яА-ЯЁё]/.test(query);
     const usdaQuery = hasCyrillic ? await translateRuToEn(query) : query;
 
@@ -281,6 +305,15 @@ app.get("/api/search", async (req, res) => {
     const off = [];
 
     const results = mergeResults(query, local, usda, off, limit);
+
+    // 🔥 если запрос был на русском → переводим product обратно
+    if (hasCyrillic) {
+      for (const item of results) {
+        if (item.source !== "local") {
+          item.product = await translateEnToRu(item.product);
+        }
+      }
+    }
 
     res.json({
       query,
@@ -316,15 +349,13 @@ app.post("/api/auto-add", async (req, res) => {
       RETURNING *;
     `;
 
-    const params = [
+    await pool.query(sql, [
       p.product,
       p.kcal_100,
       p.protein_100,
       p.fat_100,
       p.carbs_100,
-    ];
-
-    await pool.query(sql, params);
+    ]);
 
     res.json({ ok: true });
   } catch {
