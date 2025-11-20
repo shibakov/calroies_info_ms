@@ -11,6 +11,10 @@ const USDA_API_KEY =
   process.env.USDA_API_KEY ||
   "HPvXo9CKZSxS4bcAldlVWmVl2geBSI8pnilD9v3a";
 
+// 🔁 внешний бесплатный переводчик (можно переопределить env-переменной)
+const TRANSLATE_API_URL =
+  process.env.TRANSLATE_API_URL || "https://libretranslate.de/translate";
+
 const USDA_BASE_URL = "https://api.nal.usda.gov/fdc/v1/foods/search";
 const OFF_BASE_URL = "https://world.openfoodfacts.org/cgi/search.pl";
 
@@ -77,31 +81,76 @@ function normalizeString(str) {
 }
 
 // ==========================
-// 🌍 TRANSLATION RU → EN
+// 🌐 TRANSLATION (RU → EN)
 // ==========================
 async function translateRuToEn(text) {
-  try {
-    const response = await fetch("https://libretranslate.de/translate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        q: text,
-        source: "ru",
-        target: "en",
-        format: "text",
-      }),
-    });
+  const original = text || "";
+  if (!original.trim()) return original;
 
-    if (!response.ok) {
-      console.error("Translation error:", response.status);
-      return text; // fallback
+  const hasCyrillic = /[а-яА-ЯЁё]/.test(original);
+  if (!hasCyrillic) return original;
+
+  // Если нет URL переводчика — просто ничего не делаем
+  if (!TRANSLATE_API_URL) return original;
+
+  try {
+    const res = await withTimeout(
+      fetch(TRANSLATE_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        // формат LibreTranslate
+        body: JSON.stringify({
+          q: original,
+          source: "ru",
+          target: "en",
+          format: "text",
+        }),
+      }),
+      HTTP_TIMEOUT_MS
+    );
+
+    const raw = await res.text();
+
+    if (!res.ok) {
+      console.error(
+        "[translateRuToEn] Bad status from translation API:",
+        res.status,
+        res.statusText,
+        "| body snippet:",
+        raw.slice(0, 200)
+      );
+      return original;
     }
 
-    const data = await response.json();
-    return data.translatedText || text;
-  } catch (err) {
-    console.error("Translation error:", err.message);
-    return text;
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {
+      console.error(
+        "[translateRuToEn] JSON parse error:",
+        e.message,
+        "| body snippet:",
+        raw.slice(0, 200)
+      );
+      return original;
+    }
+
+    const translated =
+      data && typeof data.translatedText === "string"
+        ? data.translatedText
+        : null;
+
+    if (!translated) {
+      console.error("[translateRuToEn] Unexpected translation response:", data);
+      return original;
+    }
+
+    return translated;
+  } catch (e) {
+    console.error("[translateRuToEn] Error:", e.message);
+    return original;
   }
 }
 
@@ -186,7 +235,7 @@ async function searchUSDA(query, limit) {
 // 🔍 OFF SEARCH (disabled)
 // ==========================
 async function searchOFF() {
-  return []; // current OFF is disabled
+  return []; // временно отключено
 }
 
 // ==========================
@@ -210,7 +259,8 @@ function mergeResults(query, local, usda, off, limit) {
   const q = normalizeString(query);
 
   unique.sort((a, b) => {
-    const pr = (SOURCE_PRIORITY[a.source] || 99) - (SOURCE_PRIORITY[b.source] || 99);
+    const pr =
+      (SOURCE_PRIORITY[a.source] || 99) - (SOURCE_PRIORITY[b.source] || 99);
     if (pr !== 0) return pr;
 
     const an = normalizeString(a.product);
@@ -254,22 +304,23 @@ app.get("/api/search", async (req, res) => {
   if (limit > SEARCH_LIMIT_MAX) limit = SEARCH_LIMIT_MAX;
 
   try {
-    // Если кириллица — переводим:
+    // 1) ВСЕГДА ищем локально по оригинальной строке
+    const localPromise = searchLocal(query, limit);
+
+    // 2) Для USDA — если есть кириллица, пробуем перевод, если нет — шлём как есть
     const hasCyrillic = /[а-яА-ЯЁё]/.test(query);
-    const translated = hasCyrillic ? await translateRuToEn(query) : query;
+    const usdaQuery = hasCyrillic ? await translateRuToEn(query) : query;
 
-    const [local, usda] = await Promise.all([
-      searchLocal(query, limit),
-      searchUSDA(translated, limit),
-    ]);
+    const usdaPromise = searchUSDA(usdaQuery, limit);
 
+    const [local, usda] = await Promise.all([localPromise, usdaPromise]);
     const off = [];
 
     const results = mergeResults(query, local, usda, off, limit);
 
     res.json({
       query,
-      translated,
+      usdaQuery,
       limit,
       counts: {
         local: local.length,
@@ -280,7 +331,7 @@ app.get("/api/search", async (req, res) => {
       results,
     });
   } catch (err) {
-    console.error(err);
+    console.error("[/api/search] error:", err.message);
     res.status(500).json({ error: "Internal server error" });
   }
 });
