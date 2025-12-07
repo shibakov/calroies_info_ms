@@ -1,21 +1,14 @@
 // ==========================
-// 🔧 CONFIG
+// 📦 IMPORTS & CONFIG
 // ==========================
-const PORT = process.env.PORT || 3000;
+const express = require("express");
+const { Pool } = require("pg");
+const config = require("./config");
+const logger = require("./logger");
+const { requestLogger } = require("./middlewares/logging");
+const { errorHandler } = require("./middlewares/errorHandler");
 
-const PG_CONNECTION_STRING =
-  process.env.PG_CONNECTION_STRING ||
-  "postgresql://postgres:YECEwWBLyNtNZfLKeRXzpAyPgHODuWhu@trolley.proxy.rlwy.net:44883/railway";
-
-const USDA_API_KEY =
-  process.env.USDA_API_KEY ||
-  "HPvXo9CKZSxS4bcAldlVWmVl2geBSI8pnilD9v3a";
-
-const USDA_BASE_URL = "https://api.nal.usda.gov/fdc/v1/foods/search";
-
-const SEARCH_LIMIT_DEFAULT = 10;
-const SEARCH_LIMIT_MAX = 25;
-const HTTP_TIMEOUT_MS = 1500;
+const app = express();
 
 const SOURCE_PRIORITY = {
   local: 1,
@@ -23,31 +16,10 @@ const SOURCE_PRIORITY = {
   off: 3,
 };
 
-// GPT / OpenAI
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-// Daily targets (used for stats and "left" macros). Should be set via ENV.
-const DAILY_KCAL_TARGET = process.env.DAILY_KCAL_TARGET
-  ? Number(process.env.DAILY_KCAL_TARGET)
+// PostgreSQL
+const pool = config.pg.connectionString
+  ? new Pool({ connectionString: config.pg.connectionString })
   : null;
-const DAILY_PROTEIN_TARGET = process.env.DAILY_PROTEIN_TARGET
-  ? Number(process.env.DAILY_PROTEIN_TARGET)
-  : null;
-const DAILY_FAT_TARGET = process.env.DAILY_FAT_TARGET
-  ? Number(process.env.DAILY_FAT_TARGET)
-  : null;
-const DAILY_CARBS_TARGET = process.env.DAILY_CARBS_TARGET
-  ? Number(process.env.DAILY_CARBS_TARGET)
-  : null;
-
-// ==========================
-// 📦 IMPORTS
-// ==========================
-const express = require("express");
-const { Pool } = require("pg");
-
-const app = express();
 
 // 🚫 Disable caching
 app.use((req, res, next) => {
@@ -71,11 +43,7 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
-
-// PostgreSQL
-const pool = PG_CONNECTION_STRING
-  ? new Pool({ connectionString: PG_CONNECTION_STRING })
-  : null;
+app.use(requestLogger);
 
 // ==========================
 // ⏱ TIMEOUT UTILS
@@ -110,21 +78,23 @@ async function translateRuToEn(text) {
     encodeURIComponent(original);
 
   try {
-    const res = await withTimeout(fetch(url), 2000);
+    const res = await withTimeout(fetch(url), config.translate.timeoutMs);
     const raw = await res.text();
 
     let json;
     try {
       json = JSON.parse(raw);
     } catch (e) {
-      console.error("[translateRuToEn] Parse error, body:", raw.slice(0, 150));
+      logger.error("[translateRuToEn] Parse error", {
+        body_sample: raw.slice(0, 150),
+      });
       return original;
     }
 
     const translated = json?.[0]?.[0]?.[0];
     return translated?.toLowerCase() || original;
   } catch (err) {
-    console.error("[translateRuToEn] Network error:", err.message);
+    logger.error("[translateRuToEn] Network error", { error: err.message });
     return original;
   }
 }
@@ -142,21 +112,23 @@ async function translateEnToRu(text) {
     encodeURIComponent(original);
 
   try {
-    const res = await withTimeout(fetch(url), 2000);
+    const res = await withTimeout(fetch(url), config.translate.timeoutMs);
     const raw = await res.text();
 
     let json;
     try {
       json = JSON.parse(raw);
     } catch {
-      console.error("[translateEnToRu] Parse error, body:", raw.slice(0, 150));
+      logger.error("[translateEnToRu] Parse error", {
+        body_sample: raw.slice(0, 150),
+      });
       return original;
     }
 
     const translated = json?.[0]?.[0]?.[0];
     return translated || original;
   } catch (err) {
-    console.error("[translateEnToRu] Network error:", err.message);
+    logger.error("[translateEnToRu] Network error", { error: err.message });
     return original;
   }
 }
@@ -166,14 +138,14 @@ async function translateEnToRu(text) {
 // ==========================
 
 async function getMacrosFromGPT(product) {
-  if (!OPENAI_API_KEY) {
+  if (!config.openai.apiKey) {
     throw new Error("OPENAI_API_KEY is not configured");
   }
 
   const prompt = `Ты — помощник по нутриентам. Для продукта на русском языке верни примерную калорийность и БЖУ на 100 г. Ответь строго в JSON без комментариев и лишнего текста в формате:\n{ "kcal": number, "protein": number, "fat": number, "carbs": number }\n\nПродукт: "${product}"`;
 
   const body = {
-    model: OPENAI_MODEL,
+    model: config.openai.model,
     messages: [
       {
         role: "user",
@@ -188,16 +160,19 @@ async function getMacrosFromGPT(product) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${config.openai.apiKey}`,
       },
       body: JSON.stringify(body),
     }),
-    8000
+    config.openai.timeoutMs
   );
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    console.error("[getMacrosFromGPT] Bad status:", res.status, text.slice(0, 200));
+    logger.error("[getMacrosFromGPT] Bad status", {
+      status: res.status,
+      body_sample: text.slice(0, 200),
+    });
     throw new Error("GPT request failed");
   }
 
@@ -208,7 +183,9 @@ async function getMacrosFromGPT(product) {
   try {
     parsed = JSON.parse(content);
   } catch (e) {
-    console.error("[getMacrosFromGPT] JSON parse error:", content.slice(0, 200));
+    logger.error("[getMacrosFromGPT] JSON parse error", {
+      content_sample: content.slice(0, 200),
+    });
     throw new Error("GPT returned non-JSON");
   }
 
@@ -234,20 +211,15 @@ async function searchLocal(query, limit) {
     SELECT
       id,
       product,
-      product_type,
-      freq_usage,
-      last_used_at,
       COALESCE(kcal_100, 0)    AS kcal_100,
       COALESCE(protein_100, 0) AS protein_100,
       COALESCE(fat_100, 0)     AS fat_100,
       COALESCE(carbs_100, 0)   AS carbs_100
     FROM personal.food_dict
-    WHERE product ILIKE '%' || $1 || '%'
+    WHERE lower(product) LIKE '%' || lower($1) || '%'
     ORDER BY
-      (product ILIKE $1 || '%') DESC,
-      freq_usage DESC,
-      last_used_at DESC NULLS LAST,
-      product ASC
+      (lower(product) LIKE lower($1) || '%') DESC,
+      lower(product) ASC
     LIMIT $2;
   `;
 
@@ -259,9 +231,9 @@ async function searchLocal(query, limit) {
     id: row.id,
     product: row.product,
     brand: null,
-    product_type: row.product_type || null,
-    freq_usage: row.freq_usage != null ? Number(row.freq_usage) : 0,
-    last_used_at: row.last_used_at,
+    product_type: null,
+    freq_usage: 0,
+    last_used_at: null,
     kcal_100: Number(row.kcal_100),
     protein_100: Number(row.protein_100),
     fat_100: Number(row.fat_100),
@@ -274,15 +246,15 @@ async function searchLocal(query, limit) {
 // 🔍 USDA SEARCH
 // ==========================
 async function searchUSDA(query, limit) {
-  if (!USDA_API_KEY) return [];
+  if (!config.usda.apiKey) return [];
 
-  const url = new URL(USDA_BASE_URL);
-  url.searchParams.set("api_key", USDA_API_KEY);
+  const url = new URL(config.usda.baseUrl);
+  url.searchParams.set("api_key", config.usda.apiKey);
   url.searchParams.set("query", query);
   url.searchParams.set("pageSize", limit.toString());
 
   try {
-    const res = await withTimeout(fetch(url.toString()), HTTP_TIMEOUT_MS);
+    const res = await withTimeout(fetch(url.toString()), config.usda.timeoutMs);
     if (!res.ok) return [];
 
     const data = await res.json();
@@ -328,11 +300,11 @@ async function searchOFF() {
 
 async function insertOrGetFoodDictEntry({
   product,
-  product_type = null,
   kcal_100,
   protein_100,
   fat_100,
   carbs_100,
+  source,
 }) {
   if (!pool) throw new Error("No DB connection");
 
@@ -340,40 +312,29 @@ async function insertOrGetFoodDictEntry({
   try {
     const sqlInsert = `
       INSERT INTO personal.food_dict (
-        product, product_type, freq_usage, last_used_at,
-        kcal_100, protein_100, fat_100, carbs_100
+        product, kcal_100, protein_100, fat_100, carbs_100, source
       )
-      VALUES ($1, $2, 0, NULL, $3, $4, $5, $6)
-      ON CONFLICT (product) DO NOTHING
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (product) DO UPDATE
+      SET kcal_100 = EXCLUDED.kcal_100,
+          protein_100 = EXCLUDED.protein_100,
+          fat_100 = EXCLUDED.fat_100,
+          carbs_100 = EXCLUDED.carbs_100,
+          updated_at = now()
       RETURNING *;
     `;
 
     const paramsInsert = [
       product,
-      product_type,
       kcal_100,
       protein_100,
       fat_100,
       carbs_100,
+      source || null,
     ];
 
     const insertResult = await client.query(sqlInsert, paramsInsert);
-
-    if (insertResult.rows.length > 0) {
-      return insertResult.rows[0];
-    }
-
-    // Если запись уже существует (конфликт по product) — просто вернуть её
-    const selectResult = await client.query(
-      `SELECT * FROM personal.food_dict WHERE product = $1 LIMIT 1;`,
-      [product]
-    );
-
-    if (selectResult.rows.length === 0) {
-      throw new Error("Failed to insert or find food_dict entry");
-    }
-
-    return selectResult.rows[0];
+    return insertResult.rows[0];
   } finally {
     client.release();
   }
@@ -384,7 +345,7 @@ async function getOrCreateProductIdByName(product) {
 
   // Сначала пробуем найти в словаре
   const existing = await pool.query(
-    `SELECT id FROM personal.food_dict WHERE product = $1 LIMIT 1;`,
+    `SELECT id FROM personal.food_dict WHERE lower(product) = lower($1) LIMIT 1;`,
     [product]
   );
 
@@ -396,11 +357,11 @@ async function getOrCreateProductIdByName(product) {
   const macros = await getMacrosFromGPT(product);
   const row = await insertOrGetFoodDictEntry({
     product,
-    product_type: null, // категории жёсткие, можно обновить позже через /api/dict/update
     kcal_100: macros.kcal,
     protein_100: macros.protein,
     fat_100: macros.fat,
     carbs_100: macros.carbs,
+    source: "gpt",
   });
 
   return row.id;
@@ -413,9 +374,7 @@ async function getOrCreateProductIdByName(product) {
 async function getDailyStats(dateInput) {
   if (!pool) throw new Error("No DB connection");
 
-  const targetDate = dateInput
-    ? new Date(dateInput)
-    : new Date();
+  const targetDate = dateInput ? new Date(dateInput) : new Date();
 
   if (Number.isNaN(targetDate.getTime())) {
     throw new Error("Invalid date");
@@ -426,25 +385,24 @@ async function getDailyStats(dateInput) {
   const sql = `
     SELECT
       l.id,
-      l.product_id,
-      l.weight,
-      l.eaten_at,
-      d.product,
-      d.product_type,
+      l.product,
+      l.meal_type,
+      l.quantity_g,
+      l.created_at,
       d.kcal_100,
       d.protein_100,
       d.fat_100,
       d.carbs_100
     FROM personal.food_log l
-    JOIN personal.food_dict d ON d.id = l.product_id
-    WHERE l.eaten_at::date = $1::date
-    ORDER BY l.eaten_at ASC, l.id ASC;
+    JOIN personal.food_dict d ON lower(d.product) = lower(l.product)
+    WHERE l.created_at::date = $1::date
+    ORDER BY l.created_at ASC, l.id ASC;
   `;
 
   const { rows } = await pool.query(sql, [dateStr]);
 
   const items = rows.map((row) => {
-    const weight = Number(row.weight) || 0;
+    const weight = Number(row.quantity_g) || 0;
     const kcal_100 = Number(row.kcal_100) || 0;
     const protein_100 = Number(row.protein_100) || 0;
     const fat_100 = Number(row.fat_100) || 0;
@@ -459,15 +417,15 @@ async function getDailyStats(dateInput) {
 
     return {
       id: row.id,
-      product_id: row.product_id,
       product: row.product,
-      product_type: row.product_type,
+      product_type: null,
+      meal_type: row.meal_type,
       weight,
       kcal,
       protein,
       fat,
       carbs,
-      time: row.eaten_at,
+      time: row.created_at,
     };
   });
 
@@ -485,16 +443,16 @@ async function getDailyStats(dateInput) {
   let macros_left = { p: null, f: null, c: null, kcal: null };
 
   if (
-    DAILY_KCAL_TARGET != null &&
-    DAILY_PROTEIN_TARGET != null &&
-    DAILY_FAT_TARGET != null &&
-    DAILY_CARBS_TARGET != null
+    config.dailyTargets.kcal != null &&
+    config.dailyTargets.protein != null &&
+    config.dailyTargets.fat != null &&
+    config.dailyTargets.carbs != null
   ) {
     macros_left = {
-      p: Math.max(DAILY_PROTEIN_TARGET - macros_total.p, 0),
-      f: Math.max(DAILY_FAT_TARGET - macros_total.f, 0),
-      c: Math.max(DAILY_CARBS_TARGET - macros_total.c, 0),
-      kcal: Math.max(DAILY_KCAL_TARGET - macros_total.kcal, 0),
+      p: Math.max(config.dailyTargets.protein - macros_total.p, 0),
+      f: Math.max(config.dailyTargets.fat - macros_total.f, 0),
+      c: Math.max(config.dailyTargets.carbs - macros_total.c, 0),
+      kcal: Math.max(config.dailyTargets.kcal - macros_total.kcal, 0),
     };
   }
 
@@ -555,7 +513,8 @@ app.get("/health", async (req, res) => {
   try {
     if (pool) await pool.query("SELECT 1");
     res.json({ ok: true });
-  } catch {
+  } catch (err) {
+    logger.error("[/health] error", { error: err.message });
     res.status(500).json({ ok: false });
   }
 });
@@ -567,9 +526,9 @@ app.get("/api/search", async (req, res) => {
   const query = (req.query.query || "").trim();
   if (!query) return res.status(400).json({ error: "Parameter 'query' required" });
 
-  let limit = Number(req.query.limit || SEARCH_LIMIT_DEFAULT);
-  if (limit <= 0) limit = SEARCH_LIMIT_DEFAULT;
-  if (limit > SEARCH_LIMIT_MAX) limit = SEARCH_LIMIT_MAX;
+  let limit = Number(req.query.limit || config.search.defaultLimit);
+  if (limit <= 0) limit = config.search.defaultLimit;
+  if (limit > config.search.maxLimit) limit = config.search.maxLimit;
 
   try {
     // 1) Сначала только локальный поиск
@@ -632,7 +591,7 @@ app.get("/api/search", async (req, res) => {
       results,
     });
   } catch (err) {
-    console.error("[/api/search] error:", err.message);
+    logger.error("[/api/search] error", { error: err.message });
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -647,11 +606,11 @@ app.post("/api/auto-add", async (req, res) => {
     const p = req.body || {};
     const {
       product,
-      product_type = null,
       kcal_100,
       protein_100,
       fat_100,
       carbs_100,
+      source = "manual",
     } = p;
 
     if (!product || typeof product !== "string") {
@@ -664,26 +623,26 @@ app.post("/api/auto-add", async (req, res) => {
 
     const row = await insertOrGetFoodDictEntry({
       product,
-      product_type,
       kcal_100,
       protein_100,
       fat_100,
       carbs_100,
+      source,
     });
 
     res.json({
       id: row.id,
       product: row.product,
-      product_type: row.product_type,
-      freq_usage: row.freq_usage,
-      last_used_at: row.last_used_at,
+      source: row.source,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
       kcal_100: row.kcal_100,
       protein_100: row.protein_100,
       fat_100: row.fat_100,
       carbs_100: row.carbs_100,
     });
   } catch (err) {
-    console.error("[/api/auto-add] error:", err.message);
+    logger.error("[/api/auto-add] error", { error: err.message });
     res.status(500).json({ error: "internal" });
   }
 });
@@ -695,6 +654,12 @@ app.post("/api/dict/create_via_gpt", async (req, res) => {
   try {
     if (!pool) return res.status(500).json({ error: "No DB connection" });
 
+    // Fallback: если GPT не сконфигурирован — считаем фичу не реализованной,
+    // вместо того чтобы пытаться ходить во внешний API.
+    if (!config.openai.apiKey) {
+      return res.status(501).json({ error: "not_implemented" });
+    }
+
     const { product } = req.body || {};
     if (!product || typeof product !== "string" || !product.trim()) {
       return res.status(400).json({ error: "Field 'product' is required" });
@@ -704,7 +669,7 @@ app.post("/api/dict/create_via_gpt", async (req, res) => {
     try {
       macros = await getMacrosFromGPT(product.trim());
     } catch (err) {
-      console.error("[/api/dict/create_via_gpt] GPT error:", err.message);
+      logger.error("[/api/dict/create_via_gpt] GPT error", { error: err.message });
       return res.status(502).json({ error: "gpt_failed" });
     }
 
@@ -712,14 +677,14 @@ app.post("/api/dict/create_via_gpt", async (req, res) => {
     try {
       row = await insertOrGetFoodDictEntry({
         product: product.trim(),
-        product_type: null, // категорию можно задать/обновить отдельно
         kcal_100: macros.kcal,
         protein_100: macros.protein,
         fat_100: macros.fat,
         carbs_100: macros.carbs,
+        source: "gpt",
       });
     } catch (err) {
-      console.error("[/api/dict/create_via_gpt] DB error:", err.message);
+      logger.error("[/api/dict/create_via_gpt] DB error", { error: err.message });
       return res.status(500).json({ error: "db_error" });
     }
 
@@ -730,11 +695,12 @@ app.post("/api/dict/create_via_gpt", async (req, res) => {
       protein_100: Number(row.protein_100),
       fat_100: Number(row.fat_100),
       carbs_100: Number(row.carbs_100),
-      product_type: row.product_type,
-      freq_usage: Number(row.freq_usage || 0),
+      source: row.source,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
     });
   } catch (err) {
-    console.error("[/api/dict/create_via_gpt] error:", err.message);
+    logger.error("[/api/dict/create_via_gpt] error", { error: err.message });
     res.status(500).json({ error: "internal" });
   }
 });
@@ -758,74 +724,76 @@ app.post("/api/log/add_list", async (req, res) => {
       for (const item of list) {
         if (!item || typeof item !== "object") continue;
 
-        const weight = Number(item.weight);
+        const weight = Number(item.weight ?? item.quantity_g);
         if (!Number.isFinite(weight) || weight <= 0) {
           throw new Error("Invalid weight in list item");
         }
 
-        let productId = item.product_id;
-        if (!productId) {
-          if (!item.product) {
-            throw new Error("Either product_id or product is required");
-          }
+        let productName = item.product;
 
-          // Пытаемся найти/создать продукт по имени
-          const existing = await client.query(
-            `SELECT id FROM personal.food_dict WHERE product = $1 LIMIT 1;`,
-            [item.product]
+        // Если пришёл только product_id — берём имя из словаря
+        if (!productName && item.product_id) {
+          const byId = await client.query(
+            `SELECT product FROM personal.food_dict WHERE id = $1 LIMIT 1;`,
+            [item.product_id]
           );
-
-          if (existing.rows.length > 0) {
-            productId = existing.rows[0].id;
-          } else {
-            // Фолбек через GPT
-            const macros = await getMacrosFromGPT(item.product);
-            const inserted = await client.query(
-              `
-                INSERT INTO personal.food_dict (
-                  product, product_type, freq_usage, last_used_at,
-                  kcal_100, protein_100, fat_100, carbs_100
-                )
-                VALUES ($1, NULL, 0, NULL, $2, $3, $4, $5)
-                RETURNING id;
-              `,
-              [
-                item.product,
-                macros.kcal,
-                macros.protein,
-                macros.fat,
-                macros.carbs,
-              ]
-            );
-            productId = inserted.rows[0].id;
+          if (byId.rows.length > 0) {
+            productName = byId.rows[0].product;
           }
         }
 
-        // Вставляем лог
-        await client.query(
-          `
-            INSERT INTO personal.food_log (product_id, weight, eaten_at)
-            VALUES ($1, $2, now());
-          `,
-          [productId, weight]
+        if (!productName) {
+          throw new Error("Either product or product_id with existing product is required");
+        }
+
+        // Убеждаемся, что продукт есть в словаре (по имени, case-insensitive)
+        const existing = await client.query(
+          `SELECT id FROM personal.food_dict WHERE lower(product) = lower($1) LIMIT 1;`,
+          [productName]
         );
 
-        // Обновляем использование
+        if (existing.rows.length === 0) {
+          const macros = await getMacrosFromGPT(productName);
+          await client.query(
+            `
+              INSERT INTO personal.food_dict (
+                product, kcal_100, protein_100, fat_100, carbs_100, source
+              )
+              VALUES ($1, $2, $3, $4, $5, $6)
+              ON CONFLICT (product) DO UPDATE
+              SET kcal_100 = EXCLUDED.kcal_100,
+                  protein_100 = EXCLUDED.protein_100,
+                  fat_100 = EXCLUDED.fat_100,
+                  carbs_100 = EXCLUDED.carbs_100,
+                  updated_at = now();
+            `,
+            [
+              productName,
+              macros.kcal,
+              macros.protein,
+              macros.fat,
+              macros.carbs,
+              "gpt",
+            ]
+          );
+        }
+
+        const mealType = item.meal_type || "unspecified";
+
+        // Вставляем лог: здесь используем только имя продукта и вес
         await client.query(
           `
-            UPDATE personal.food_dict
-            SET freq_usage = freq_usage + 1,
-                last_used_at = now()
-            WHERE id = $1;
+            INSERT INTO personal.food_log (meal_type, product, quantity_g)
+            VALUES ($1, $2, $3);
           `,
-          [productId]
+          [mealType, productName, weight]
         );
       }
 
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
-      console.error("[/api/log/add_list] TX error:", err.message);
+      logger.error("[/api/log/add_list] TX error", { error: err.message });
       return res.status(500).json({ error: "internal" });
     } finally {
       client.release();
@@ -836,7 +804,7 @@ app.post("/api/log/add_list", async (req, res) => {
     try {
       stats = await getDailyStats(new Date());
     } catch (err) {
-      console.error("[/api/log/add_list] stats error:", err.message);
+      logger.error("[/api/log/add_list] stats error", { error: err.message });
       return res.status(500).json({ error: "stats_error" });
     }
 
@@ -849,7 +817,7 @@ app.post("/api/log/add_list", async (req, res) => {
       left_macros: stats.macros_left,
     });
   } catch (err) {
-    console.error("[/api/log/add_list] error:", err.message);
+    logger.error("[/api/log/add_list] error", { error: err.message });
     res.status(500).json({ error: "internal" });
   }
 });
@@ -880,7 +848,7 @@ app.post("/api/log/update_item", async (req, res) => {
       await client.query("BEGIN");
 
       const existing = await client.query(
-        `SELECT eaten_at FROM personal.food_log WHERE id = $1;`,
+        `SELECT created_at FROM personal.food_log WHERE id = $1;`,
         [logId]
       );
       if (existing.rows.length === 0) {
@@ -888,17 +856,17 @@ app.post("/api/log/update_item", async (req, res) => {
         return res.status(404).json({ error: "log_not_found" });
       }
 
-      eatenAt = existing.rows[0].eaten_at;
+      eatenAt = existing.rows[0].created_at;
 
       await client.query(
-        `UPDATE personal.food_log SET weight = $2 WHERE id = $1;`,
+        `UPDATE personal.food_log SET quantity_g = $2 WHERE id = $1;`,
         [logId, newWeight]
       );
 
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
-      console.error("[/api/log/update_item] TX error:", err.message);
+      logger.error("[/api/log/update_item] TX error", { error: err.message });
       return res.status(500).json({ error: "internal" });
     } finally {
       client.release();
@@ -909,7 +877,7 @@ app.post("/api/log/update_item", async (req, res) => {
     try {
       stats = await getDailyStats(eatenAt || new Date());
     } catch (err) {
-      console.error("[/api/log/update_item] stats error:", err.message);
+      logger.error("[/api/log/update_item] stats error", { error: err.message });
       return res.status(500).json({ error: "stats_error" });
     }
 
@@ -922,7 +890,7 @@ app.post("/api/log/update_item", async (req, res) => {
       left_macros: stats.macros_left,
     });
   } catch (err) {
-    console.error("[/api/log/update_item] error:", err.message);
+    logger.error("[/api/log/update_item] error", { error: err.message });
     res.status(500).json({ error: "internal" });
   }
 });
@@ -956,9 +924,10 @@ app.post("/api/dict/update", async (req, res) => {
       SET kcal_100 = $2,
           protein_100 = $3,
           fat_100 = $4,
-          carbs_100 = $5
+          carbs_100 = $5,
+          updated_at = now()
       WHERE id = $1
-      RETURNING id, product, product_type, freq_usage, last_used_at,
+      RETURNING id, product, source, created_at, updated_at,
                 kcal_100, protein_100, fat_100, carbs_100;
     `;
 
@@ -979,16 +948,16 @@ app.post("/api/dict/update", async (req, res) => {
     res.json({
       id: row.id,
       product: row.product,
-      product_type: row.product_type,
-      freq_usage: Number(row.freq_usage || 0),
-      last_used_at: row.last_used_at,
+      source: row.source,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
       kcal_100: Number(row.kcal_100),
       protein_100: Number(row.protein_100),
       fat_100: Number(row.fat_100),
       carbs_100: Number(row.carbs_100),
     });
   } catch (err) {
-    console.error("[/api/dict/update] error:", err.message);
+    logger.error("[/api/dict/update] error", { error: err.message });
     res.status(500).json({ error: "internal" });
   }
 });
@@ -1006,7 +975,7 @@ app.get("/api/stats/daily", async (req, res) => {
     try {
       stats = await getDailyStats(dateParam);
     } catch (err) {
-      console.error("[/api/stats/daily] stats error:", err.message);
+      logger.error("[/api/stats/daily] stats error", { error: err.message });
       return res.status(400).json({ error: "invalid_date" });
     }
 
@@ -1017,14 +986,17 @@ app.get("/api/stats/daily", async (req, res) => {
       items: stats.items,
     });
   } catch (err) {
-    console.error("[/api/stats/daily] error:", err.message);
+    logger.error("[/api/stats/daily] error", { error: err.message });
     res.status(500).json({ error: "internal" });
   }
 });
 
+// Register error handler as the last middleware
+app.use(errorHandler);
+
 // ==========================
 // 🚀 START
 // ==========================
-app.listen(PORT, () => {
-  console.log(`API server listening on port ${PORT}`);
+app.listen(config.server.port, () => {
+  logger.info("API server listening", { port: config.server.port });
 });
