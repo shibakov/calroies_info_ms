@@ -991,6 +991,37 @@ app.get("/api/stats/daily", async (req, res) => {
   }
 });
 
+// ==========================
+// 📊 /api/stats/limits
+// ==========================
+app.get("/api/stats/limits", async (req, res) => {
+  try {
+    if (!pool) return res.status(500).json({ error: "No DB connection" });
+
+    const sql = `
+      SELECT
+        MAX(CASE WHEN feature_key='kcal_per_day'      THEN value_num END) AS kcal,
+        MAX(CASE WHEN feature_key='protein_g_per_day' THEN value_num END) AS protein,
+        MAX(CASE WHEN feature_key='fat_g_per_day'     THEN value_num END) AS fat,
+        MAX(CASE WHEN feature_key='carbs_g_per_day'   THEN value_num END) AS carbs
+      FROM personal.feature_value;
+    `;
+
+    const { rows } = await pool.query(sql);
+    const row = rows[0] || {};
+
+    res.json({
+      kcal: row.kcal != null ? Number(row.kcal) : null,
+      protein: row.protein != null ? Number(row.protein) : null,
+      fat: row.fat != null ? Number(row.fat) : null,
+      carbs: row.carbs != null ? Number(row.carbs) : null,
+    });
+  } catch (err) {
+    logger.error("[/api/stats/limits] error", { error: err.message });
+    res.status(500).json({ error: "internal" });
+  }
+});
+
 // Register error handler as the last middleware
 app.use(errorHandler);
 
