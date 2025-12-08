@@ -472,6 +472,24 @@ async function getDailyStats(dateInput) {
 }
 
 // ==========================
+// 🧮 LOG_RESPONSE HELPER
+// ==========================
+
+async function getTodayLogResponses() {
+  if (!pool) throw new Error("No DB connection");
+
+  const sql = `
+    SELECT *
+    FROM personal.log_response
+    WHERE datetime::date = CURRENT_DATE
+    ORDER BY datetime;
+  `;
+
+  const { rows } = await pool.query(sql);
+  return rows;
+}
+
+// ==========================
 // 🧠 MERGE RESULTS (USED ONLY IF НУЖНО ОБЪЕДИНЯТЬ ИСТОЧНИКИ)
 // ==========================
 function mergeResults(query, local, usda, off, limit) {
@@ -970,6 +988,285 @@ app.post("/api/dict/update", async (req, res) => {
 });
 
 // ==========================
+// 🧾 /api/dict/product (CRUD для словаря продуктов)
+// ==========================
+
+// Создание нового продукта
+app.post("/api/dict/product", async (req, res) => {
+  try {
+    if (!pool) return res.status(500).json({ error: "No DB connection" });
+
+    const {
+      product,
+      kcal_100,
+      protein_100,
+      fat_100,
+      carbs_100,
+      source = "manual",
+    } = req.body || {};
+
+    if (!product || typeof product !== "string" || !product.trim()) {
+      return res.status(400).json({ error: "Field 'product' is required" });
+    }
+
+    if ([kcal_100, protein_100, fat_100, carbs_100].some((v) => v == null)) {
+      return res.status(400).json({ error: "All macro fields are required" });
+    }
+
+    const sqlInsert = `
+      INSERT INTO personal.food_dict (
+        product, kcal_100, protein_100, fat_100, carbs_100, source
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (product) DO NOTHING
+      RETURNING id, product, source, created_at, updated_at,
+                kcal_100, protein_100, fat_100, carbs_100;
+    `;
+
+    const { rows } = await pool.query(sqlInsert, [
+      product.trim(),
+      kcal_100,
+      protein_100,
+      fat_100,
+      carbs_100,
+      source || null,
+    ]);
+
+    if (rows.length === 0) {
+      // Продукт с таким названием уже существует
+      const existing = await pool.query(
+        `SELECT id, product, source, created_at, updated_at,
+                kcal_100, protein_100, fat_100, carbs_100
+         FROM personal.food_dict
+         WHERE lower(product) = lower($1)
+         LIMIT 1;`,
+        [product.trim()]
+      );
+
+      if (existing.rows.length > 0) {
+        const row = existing.rows[0];
+        return res.status(409).json({
+          error: "product_exists",
+          id: row.id,
+          product: row.product,
+          source: row.source,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          kcal_100: Number(row.kcal_100),
+          protein_100: Number(row.protein_100),
+          fat_100: Number(row.fat_100),
+          carbs_100: Number(row.carbs_100),
+        });
+      }
+
+      return res.status(500).json({ error: "insert_failed" });
+    }
+
+    const row = rows[0];
+
+    res.status(201).json({
+      id: row.id,
+      product: row.product,
+      source: row.source,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      kcal_100: Number(row.kcal_100),
+      protein_100: Number(row.protein_100),
+      fat_100: Number(row.fat_100),
+      carbs_100: Number(row.carbs_100),
+    });
+  } catch (err) {
+    logger.error("[/api/dict/product POST] error", { error: err.message });
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+// Редактирование продукта
+app.patch("/api/dict/product", async (req, res) => {
+  try {
+    if (!pool) return res.status(500).json({ error: "No DB connection" });
+
+    const {
+      product_id,
+      product,
+      kcal_100,
+      protein_100,
+      fat_100,
+      carbs_100,
+      source,
+    } = req.body || {};
+
+    const id = Number(product_id);
+    if (!Number.isFinite(id) || id <= 0) {
+      return res
+        .status(400)
+        .json({ error: "Field 'product_id' must be a positive number" });
+    }
+
+    const fields = [];
+    const params = [id];
+
+    if (product !== undefined) {
+      if (!product || typeof product !== "string" || !product.trim()) {
+        return res
+          .status(400)
+          .json({ error: "Field 'product' must be a non-empty string" });
+      }
+      params.push(product.trim());
+      fields.push(`product = $${params.length}`);
+    }
+
+    if (kcal_100 !== undefined) {
+      params.push(kcal_100);
+      fields.push(`kcal_100 = $${params.length}`);
+    }
+
+    if (protein_100 !== undefined) {
+      params.push(protein_100);
+      fields.push(`protein_100 = $${params.length}`);
+    }
+
+    if (fat_100 !== undefined) {
+      params.push(fat_100);
+      fields.push(`fat_100 = $${params.length}`);
+    }
+
+    if (carbs_100 !== undefined) {
+      params.push(carbs_100);
+      fields.push(`carbs_100 = $${params.length}`);
+    }
+
+    if (source !== undefined) {
+      params.push(source || null);
+      fields.push(`source = $${params.length}`);
+    }
+
+    if (fields.length === 0) {
+      return res.status(400).json({ error: "No fields to update" });
+    }
+
+    const sql = `
+      UPDATE personal.food_dict
+      SET ${fields.join(", ")},
+          updated_at = now()
+      WHERE id = $1
+      RETURNING id, product, source, created_at, updated_at,
+                kcal_100, protein_100, fat_100, carbs_100;
+    `;
+
+    let rows;
+    try {
+      ({ rows } = await pool.query(sql, params));
+    } catch (err) {
+      // Конфликт по уникальному имени продукта
+      if (err.code === "23505") {
+        return res.status(409).json({ error: "product_name_conflict" });
+      }
+      throw err;
+    }
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "product_not_found" });
+    }
+
+    const row = rows[0];
+
+    res.json({
+      id: row.id,
+      product: row.product,
+      source: row.source,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      kcal_100: Number(row.kcal_100),
+      protein_100: Number(row.protein_100),
+      fat_100: Number(row.fat_100),
+      carbs_100: Number(row.carbs_100),
+    });
+  } catch (err) {
+    logger.error("[/api/dict/product PATCH] error", { error: err.message });
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+// Удаление продукта с учётом использования в food_log
+app.delete("/api/dict/product", async (req, res) => {
+  try {
+    if (!pool) return res.status(500).json({ error: "No DB connection" });
+
+    const { product_id } = req.body || {};
+    const id = Number(product_id);
+
+    if (!Number.isFinite(id) || id <= 0) {
+      return res
+        .status(400)
+        .json({ error: "Field 'product_id' must be a positive number" });
+    }
+
+    // 1) Берём название продукта из словаря
+    const dictRes = await pool.query(
+      `SELECT id, product, source, created_at, updated_at,
+              kcal_100, protein_100, fat_100, carbs_100
+       FROM personal.food_dict
+       WHERE id = $1
+       LIMIT 1;`,
+      [id]
+    );
+
+    if (dictRes.rows.length === 0) {
+      return res.status(404).json({ error: "product_not_found" });
+    }
+
+    const dictRow = dictRes.rows[0];
+    const productName = dictRow.product;
+
+    // 2) Проверяем, используется ли этот product в food_log
+    const logRes = await pool.query(
+      `SELECT 1
+       FROM personal.food_log
+       WHERE lower(product) = lower($1)
+       LIMIT 1;`,
+      [productName]
+    );
+
+    if (logRes.rows.length > 0) {
+      // Нельзя удалить, пока есть логи, ссылающиеся на это имя продукта
+      return res.status(409).json({ error: "product_in_use" });
+    }
+
+    // 3) Удаляем запись из словаря
+    const delRes = await pool.query(
+      `DELETE FROM personal.food_dict
+       WHERE id = $1
+       RETURNING id, product, source, created_at, updated_at,
+                 kcal_100, protein_100, fat_100, carbs_100;`,
+      [id]
+    );
+
+    if (delRes.rows.length === 0) {
+      return res.status(404).json({ error: "product_not_found" });
+    }
+
+    const row = delRes.rows[0];
+
+    res.json({
+      deleted: true,
+      id: row.id,
+      product: row.product,
+      source: row.source,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      kcal_100: Number(row.kcal_100),
+      protein_100: Number(row.protein_100),
+      fat_100: Number(row.fat_100),
+      carbs_100: Number(row.carbs_100),
+    });
+  } catch (err) {
+    logger.error("[/api/dict/product DELETE] error", { error: err.message });
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+// ==========================
 // 📊 /api/stats/daily
 // ==========================
 app.get("/api/stats/daily", async (req, res) => {
@@ -979,16 +1276,22 @@ app.get("/api/stats/daily", async (req, res) => {
     const dateParam = req.query.date || new Date().toISOString().slice(0, 10);
 
     let stats;
-    let textReport = null;
+    let logResponses = [];
     try {
       stats = await getDailyStats(dateParam);
 
-      // Текстовый отчёт по сегодняшнему дню из sql/queries/log_response.sql
+      // 1) инсерт свежего отчёта за сегодня (log_response.sql = чистый INSERT)
       try {
-        const { rows } = await pool.query(logResponseSql);
-        textReport = rows[0]?.text_report || null;
+        await pool.query(logResponseSql);
       } catch (err) {
-        logger.error("[/api/stats/daily] log_response_sql error", { error: err.message });
+        logger.error("[/api/stats/daily] log_response_insert error", { error: err.message });
+      }
+
+      // 2) выборка всех строк за текущий день из personal.log_response
+      try {
+        logResponses = await getTodayLogResponses();
+      } catch (err) {
+        logger.error("[/api/stats/daily] log_response_select error", { error: err.message });
       }
     } catch (err) {
       logger.error("[/api/stats/daily] stats error", { error: err.message });
@@ -1000,7 +1303,7 @@ app.get("/api/stats/daily", async (req, res) => {
       macros_total: stats.macros_total,
       macros_left: stats.macros_left,
       items: stats.items,
-      text_report: textReport,
+      log_responses: logResponses,
     });
   } catch (err) {
     logger.error("[/api/stats/daily] error", { error: err.message });

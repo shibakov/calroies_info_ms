@@ -132,7 +132,8 @@ tops_text AS (
     ) t
 )
 
--- === 8) ФИНАЛЬНЫЙ ОТЧЁТ ===
+-- === 8) INSERT ONLY (одна актуальная запись в personal.log_response) ===
+INSERT INTO personal.log_response (text_report, datetime)
 SELECT
     '🎯 Баланс дня [' ||
     to_char(l.date_time, 'DD.MM.YYYY, HH24:MI') || ']' || E'\n\n' ||
@@ -156,9 +157,11 @@ SELECT
     '🥇 Топ-3 продуктов по категориям' || E'\n' ||
     COALESCE(tp.text, 'нет данных')
 
-AS text_report
+AS text_report,
+CURRENT_TIMESTAMP + INTERVAL '4 HOURS' as datetime
 FROM totals t
 CROSS JOIN limits l
 LEFT JOIN last_meal_meta  m  ON TRUE
 LEFT JOIN last_meal_text  lm ON TRUE
-LEFT JOIN tops_text       tp ON TRUE;
+LEFT JOIN tops_text       tp ON TRUE
+RETURNING *;
