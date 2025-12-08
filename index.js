@@ -3,10 +3,17 @@
 // ==========================
 const express = require("express");
 const { Pool } = require("pg");
+const fs = require("fs");
+const path = require("path");
 const config = require("./config");
 const logger = require("./logger");
 const { requestLogger } = require("./middlewares/logging");
 const { errorHandler } = require("./middlewares/errorHandler");
+
+const logResponseSql = fs.readFileSync(
+  path.join(__dirname, "sql/queries/log_response.sql"),
+  "utf8"
+);
 
 const app = express();
 
@@ -972,8 +979,17 @@ app.get("/api/stats/daily", async (req, res) => {
     const dateParam = req.query.date || new Date().toISOString().slice(0, 10);
 
     let stats;
+    let textReport = null;
     try {
       stats = await getDailyStats(dateParam);
+
+      // Текстовый отчёт по сегодняшнему дню из sql/queries/log_response.sql
+      try {
+        const { rows } = await pool.query(logResponseSql);
+        textReport = rows[0]?.text_report || null;
+      } catch (err) {
+        logger.error("[/api/stats/daily] log_response_sql error", { error: err.message });
+      }
     } catch (err) {
       logger.error("[/api/stats/daily] stats error", { error: err.message });
       return res.status(400).json({ error: "invalid_date" });
@@ -984,6 +1000,7 @@ app.get("/api/stats/daily", async (req, res) => {
       macros_total: stats.macros_total,
       macros_left: stats.macros_left,
       items: stats.items,
+      text_report: textReport,
     });
   } catch (err) {
     logger.error("[/api/stats/daily] error", { error: err.message });
