@@ -991,6 +991,47 @@ app.post("/api/dict/update", async (req, res) => {
 // 🧾 /api/dict/product (CRUD для словаря продуктов)
 // ==========================
 
+// Получение актуального словаря
+app.get("/api/dict/product", async (req, res) => {
+  try {
+    if (!pool) return res.status(500).json({ error: "No DB connection" });
+
+    const sql = `
+      SELECT
+        id,
+        product,
+        source,
+        created_at,
+        updated_at,
+        kcal_100,
+        protein_100,
+        fat_100,
+        carbs_100
+      FROM personal.food_dict
+      ORDER BY lower(product) ASC;
+    `;
+
+    const { rows } = await pool.query(sql);
+
+    const items = rows.map((row) => ({
+      id: row.id,
+      product: row.product,
+      source: row.source,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      kcal_100: row.kcal_100 != null ? Number(row.kcal_100) : null,
+      protein_100: row.protein_100 != null ? Number(row.protein_100) : null,
+      fat_100: row.fat_100 != null ? Number(row.fat_100) : null,
+      carbs_100: row.carbs_100 != null ? Number(row.carbs_100) : null,
+    }));
+
+    res.json({ items });
+  } catch (err) {
+    logger.error("[/api/dict/product GET] error", { error: err.message });
+    res.status(500).json({ error: "internal" });
+  }
+});
+
 // Создание нового продукта
 app.post("/api/dict/product", async (req, res) => {
   try {
